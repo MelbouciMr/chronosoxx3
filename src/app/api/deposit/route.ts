@@ -1,31 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase";
-import { createPublicClient, http, parseUnits, formatUnits } from "viem";
+import { createPublicClient, http, formatUnits } from "viem";
 import { base } from "viem/chains";
 
-// USDC on Base mainnet
 const USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const;
-const CHRONOS_RECEIVER = process.env.CHRONOS_WALLET_ADDRESS as `0x${string}`;
 
 const publicClient = createPublicClient({
   chain: base,
   transport: http(process.env.BASE_RPC_URL || "https://mainnet.base.org"),
 });
 
-// Minimal ERC-20 ABI for Transfer event
-const ERC20_ABI = [
-  {
-    name: "Transfer",
-    type: "event",
-    inputs: [
-      { name: "from", type: "address", indexed: true },
-      { name: "to", type: "address", indexed: true },
-      { name: "value", type: "uint256", indexed: false },
-    ],
-  },
-] as const;
+const TRANSFER_EVENT = {
+  name: "Transfer",
+  type: "event" as const,
+  inputs: [
+    { name: "from", type: "address" as const, indexed: true },
+    { name: "to", type: "address" as const, indexed: true },
+    { name: "value", type: "uint256" as const, indexed: false },
+  ],
+};
 
-// POST /api/deposit { txHash, userWallet, agentId }
+// POST /api/deposit  { txHash, userWallet, agentId }
 export async function POST(req: NextRequest) {
   try {
     const { txHash, userWallet, agentId } = await req.json();
@@ -45,25 +40,21 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Transaction already processed" }, { status: 409 });
     }
 
-    // Verify on-chain
     let amountUsdc = 0;
+
     try {
-      const receipt = await publicClient.getTransactionReceipt({
-        hash: txHash as `0x${string}`,
-      });
+      const receipt = await publicClient.getTransactionReceipt({ hash: txHash as `0x${string}` });
 
       if (receipt.status !== "success") {
         return NextResponse.json({ error: "Transaction failed on-chain" }, { status: 400 });
       }
 
-      // Parse Transfer logs from USDC contract
+      const receiverWallet = process.env.CHRONOS_WALLET_ADDRESS as `0x${string}`;
+
       const logs = await publicClient.getLogs({
         address: USDC_ADDRESS,
-        event: ERC20_ABI[0],
-        args: {
-          from: userWallet as `0x${string}`,
-          to: CHRONOS_RECEIVER,
-        },
+        event: TRANSFER_EVENT,
+        args: { from: userWallet as `0x${string}`, to: receiverWallet },
         blockHash: receipt.blockHash,
       });
 
@@ -71,12 +62,10 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: "No USDC transfer to Chronos found in tx" }, { status: 400 });
       }
 
-      // Sum all matching transfers (usually just one)
-      const totalRaw = logs.reduce((sum, log) => sum + (log.args.value ?? 0n), 0n);
-      amountUsdc = parseFloat(formatUnits(totalRaw, 6)); // USDC has 6 decimals
+      const totalRaw = logs.reduce((sum, log) => sum + ((log.args as { value?: bigint }).value ?? 0n), 0n);
+      amountUsdc = parseFloat(formatUnits(totalRaw, 6));
     } catch (chainErr) {
       console.error("Chain verification error:", chainErr);
-      // In development/testnet, allow manual override via env
       if (process.env.NODE_ENV === "development") {
         amountUsdc = parseFloat(req.nextUrl.searchParams.get("devAmount") || "0");
       } else {
@@ -97,21 +86,18 @@ export async function POST(req: NextRequest) {
       confirmed: true,
     });
 
-    // Credit balance (upsert)
-    const { data: existing_balance } = await supabaseAdmin
+    // Upsert balance
+    const { data: bal } = await supabaseAdmin
       .from("balances")
       .select("balance_usdc")
       .eq("user_wallet", userWallet.toLowerCase())
       .eq("agent_id", agentId)
       .single();
 
-    if (existing_balance) {
+    if (bal) {
       await supabaseAdmin
         .from("balances")
-        .update({
-          balance_usdc: existing_balance.balance_usdc + amountUsdc,
-          updated_at: new Date().toISOString(),
-        })
+        .update({ balance_usdc: bal.balance_usdc + amountUsdc, updated_at: new Date().toISOString() })
         .eq("user_wallet", userWallet.toLowerCase())
         .eq("agent_id", agentId);
     } else {
@@ -122,11 +108,7 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    return NextResponse.json({
-      ok: true,
-      credited: amountUsdc,
-      txHash,
-    });
+    return NextResponse.json({ ok: true, credited: amountUsdc, txHash });
   } catch (err) {
     console.error("Deposit error:", err);
     return NextResponse.json({ error: "Server error" }, { status: 500 });
@@ -157,8 +139,5 @@ export async function GET(req: NextRequest) {
     .order("created_at", { ascending: false })
     .limit(10);
 
-  return NextResponse.json({
-    balance: balance?.balance_usdc ?? 0,
-    deposits: deposits ?? [],
-  });
+  return NextResponse.json({ balance: balance?.balance_usdc ?? 0, deposits: deposits ?? [] });
 }
